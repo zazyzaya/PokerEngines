@@ -1,67 +1,22 @@
-from copy import deepcopy 
-from random import random, shuffle, choice
-
-import numpy as np 
-
-# Following along from here 
-# https://web.archive.org/web/20250226120224/https://aipokertutorial.com/the-cfr-algorithm/#comparing-algorithms
+from vanilla_cfr import CFR_Solver
+from globals import P1, P2, C
 
 PASS = 0; BET = 1; NUM_ACTIONS = 2
 K=2; Q=1; J=0
 
-class InfoSet: 
-    def __init__(self): 
-        self.cum_strat = np.zeros(NUM_ACTIONS)
-        self.cum_regret = np.zeros(NUM_ACTIONS)
-        self.strat = self.default_strat()
-        
-        # For testing, not used in algos
-        self.cum_util = 0 
-        self.visits = 0 
-
-    def update(self): 
-        self.strat = self.get_avg_strat()
-        self.cum_strat = np.zeros(NUM_ACTIONS)
-        self.cum_regret = np.zeros(NUM_ACTIONS)
-
-    def update_strat(self): 
-        non_neg_regret = np.maximum(self.cum_regret, 0)
-        norm = non_neg_regret.sum()
-
-        if norm == 0: 
-            self.strat = self.default_strat()
-        else: 
-            self.strat = non_neg_regret / norm 
-    
-    def get_avg_strat(self): 
-        '''
-        This is what converges to a NE, not the internal strat 
-        Though it itself is not used during the "training" runs 
-        '''
-        norm_sum = self.cum_strat.sum() 
-
-        if norm_sum: 
-            avg_strat = self.cum_strat / norm_sum 
-        else: 
-            avg_strat = self.default_strat()
-
-        return avg_strat
-
-    def default_strat(self): 
-        return np.full(NUM_ACTIONS, 1./NUM_ACTIONS)
-
-
-P1=0; P2=1; C=2
 class Node: 
-    def __init__(self, parent): 
-        self.parent = parent 
+    def __init__(self): 
+        self.is_leaf = False 
 
 class LeafNode(Node): 
     def __init__(self, parent, cards, player, history, depth): 
+        super().__init__()
+
         self.parent = parent 
         self.cards = cards 
         self.history = history 
         self.player = player
+        self.is_leaf = True
     
     def reward(self): 
         # Determine pot value (only 2 if two bets, otherwise 1)
@@ -85,6 +40,8 @@ CARD_MAP = {0:'J', 1:'Q', 2:'K'}
 ACTION_MAP = {'0':'P', '1':'B'}
 class PlayerNode(Node): 
     def __init__(self, parent, cards, player, history, depth): 
+        super().__init__()
+
         self.parent = parent 
         self.cards = cards 
         self.player = player
@@ -126,6 +83,8 @@ class PlayerNode(Node):
 
 class KuhnRoot(Node): 
     def __init__(self): 
+        super().__init__()
+        
         self.parent = None 
         self.player = C 
         self.depth = 0 
@@ -141,71 +100,6 @@ class KuhnRoot(Node):
                 (J,K),(J,Q)
             ]
         ]
-
-class CFR_Solver: 
-    def __init__(self): 
-        self.info_sets = dict()
-
-    def eval_game(self, game_node):
-        if isinstance(game_node, LeafNode):
-            return game_node.reward()
-
-        if game_node.player == C:
-            v = 0
-            for p, child in zip(game_node.probs, game_node.children):
-                v += p * self.eval_game(child)
-            return v
-
-        # Really shouldn't run, as agents should be trained prior to this, 
-        # but allow it in case we want to get baseline for random strat
-        if (info_set := self.info_sets.get(game_node.infoSet())) is None: 
-            self.info_sets[game_node.infoSet()] = info_set = InfoSet()
-        
-        strat = info_set.get_avg_strat()
-        v = 0
-        for a, child in enumerate(game_node.children):
-            v += strat[a] * self.eval_game(child)
-
-        return v
-    
-    def cfr(self, game_node, player, pi_1, pi_2): 
-        pi_i = pi_1 if player == P1 else pi_2 
-        pi_not_i = pi_2 if player == P1 else pi_1 
-
-        if isinstance(game_node, LeafNode): 
-            r = game_node.reward()
-            if player == P1: 
-                return r 
-            return -r 
-        
-        if game_node.player == C: # Chance node
-            child = choice(game_node.children)
-            return self.cfr(child, player, pi_1, pi_2)
-        
-        if (info_set := self.info_sets.get(game_node.infoSet())) is None: 
-            self.info_sets[game_node.infoSet()] = info_set = InfoSet()
-
-        v_sigma = 0 
-        cf_value = np.zeros(len(game_node.children))
-        for a,c in enumerate(game_node.children): 
-            # Propagate into children with prob of getting here * prev prob 
-            if game_node.player == P1: 
-                cf_value[a] = self.cfr(c, player, info_set.strat[a] * pi_1, pi_2)
-            elif game_node.player == P2: 
-                cf_value[a] = self.cfr(c, player, pi_1, info_set.strat[a] * pi_2)
-
-            v_sigma += info_set.strat[a] * cf_value[a] 
-
-        if game_node.player == player: 
-            for a in range(len(game_node.children)): 
-                info_set.cum_regret[a] += pi_not_i * (cf_value[a] - v_sigma)
-                info_set.cum_strat[a] += pi_i * info_set.strat[a]
-
-            info_set.update_strat()
-            info_set.visits += 1
-            info_set.cum_util += v_sigma 
-
-        return v_sigma 
     
 
 if __name__ == '__main__': 
