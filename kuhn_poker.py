@@ -1,15 +1,11 @@
 from vanilla_cfr import CFR_Solver
 from mccfr import MCCFR_Solver
-from globals import P1, P2, C
+from globals import P1, P2, C, AbstractGameNode
 
 PASS = 0; BET = 1; NUM_ACTIONS = 2
 K=2; Q=1; J=0
 
-class Node:
-    def __init__(self):
-        self.is_leaf = False
-
-class LeafNode(Node):
+class LeafNode(AbstractGameNode):
     def __init__(self, parent, cards, player, history, depth):
         super().__init__()
 
@@ -39,7 +35,7 @@ class LeafNode(Node):
 
 CARD_MAP = {0:'J', 1:'Q', 2:'K'}
 ACTION_MAP = {'0':'P', '1':'B'}
-class PlayerNode(Node):
+class PlayerNode(AbstractGameNode):
     def __init__(self, parent, cards, player, history, depth):
         super().__init__()
 
@@ -82,7 +78,7 @@ class PlayerNode(Node):
         return children
 
 
-class KuhnRoot(Node):
+class KuhnRoot(AbstractGameNode):
     def __init__(self):
         super().__init__()
 

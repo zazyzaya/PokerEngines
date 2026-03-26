@@ -33,3 +33,9 @@ HOSTNAMES = [
 ]
 
 HOST_TO_IDX = {h:i for i,h in enumerate(HOSTNAMES)}
+
+class AbstractGameNode:
+    '''
+    All game nodes inherit from this
+    '''
+    pass

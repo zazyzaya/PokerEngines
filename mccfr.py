@@ -1,4 +1,5 @@
 from random import random, randint
+import time
 
 import numpy as np
 
@@ -68,12 +69,12 @@ class MCCFR_Solver(CFR_Solver):
 
             # Regret update
             if node.player == P1:
-                u_i_now = u_i
+                u_i_now = -u_i
                 pi_not_i_z = pi_2_z # pi_{-i}(z)
                 reach_i = reach_1   # pi_i(z[I])
                 tail_i_a = tail_1   # pi_i(z[I]a, z)
             elif node.player == P2:
-                u_i_now = -u_i
+                u_i_now = u_i
                 pi_not_i_z = pi_1_z
                 reach_i = reach_2
                 tail_i_a = tail_2
@@ -99,3 +100,67 @@ class MCCFR_Solver(CFR_Solver):
                 tail_1 *= infoSet.strat[action]
             else:
                 tail_2 *= infoSet.strat[action]
+
+    def one_player_mccfr(self, t, game_node, player):
+        st = time.time()
+        trace, u_i, pi_z, pi_1_z, pi_2_z =  self.sample_history(game_node)
+        en = time.time()
+        sim_time = en-st
+
+        st = time.time()
+        tail_1, tail_2 = 1., 1.
+
+        # Propagate pi_sigma_i(h, z) backward
+        for i in range(len(trace)-1, -1, -1):
+            node,action,reach_1,reach_2 = trace[i]
+
+            if node.player == C:
+                continue
+
+            if node.player == player:
+                # Regret update
+                if node.player == P1:
+                    u_i_now = u_i
+                    pi_not_i_z = pi_2_z # pi_{-i}(z)
+                    reach_i = reach_1   # pi_i(z[I])
+                    tail_i_a = tail_1   # pi_i(z[I]a, z)
+                elif node.player == P2:
+                    u_i_now = -u_i
+                    pi_not_i_z = pi_1_z
+                    reach_i = reach_2
+                    tail_i_a = tail_2
+
+                infoSet = self.get_info_set(node)
+                tail_i = tail_i_a * infoSet.strat[action]   # pi_i(z[I], z)
+                w_I = (u_i_now * pi_not_i_z) / pi_z         # w_I (obviously)
+
+                for a in range(len(node.children)):
+                    if a == action:
+                        regret = w_I * (tail_i_a - tail_i)
+                    else:
+                        regret = -w_I * tail_i
+
+                    # Vanilla CFR
+                    infoSet.cum_regret[a] += regret
+
+                    # CFR+ (Not really meant for MC setting--didn't see any improvemnts)
+                    #infoSet.cum_regret[a] = max(0.0, infoSet.cum_regret[a] + regret)
+
+                iterationsMissed = t - infoSet.last_visit
+
+                # Vanilla CFR
+                infoSet.cum_strat += iterationsMissed * reach_i * infoSet.strat
+
+                # CFR+
+                #infoSet.cum_strat += t * reach_i * infoSet.strat
+
+                infoSet.last_visit = t
+                infoSet.update_strat()
+
+                if node.player == P1:
+                    tail_1 *= infoSet.strat[action]
+                else:
+                    tail_2 *= infoSet.strat[action]
+
+        en = time.time()
+        return sim_time, en-st
