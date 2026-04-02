@@ -29,6 +29,12 @@ class InfoSet:
         else:
             self.strat = non_neg_regret / norm
 
+        # If it's been training a really long time, these values will
+        # get huge. Periodically adjust them back down to avoid
+        # FLOP precision loss
+        if np.sum(self.cum_strat) > 1e12:
+            self.cum_strat /= 1e6
+
     def get_avg_strat(self):
         '''
         This is what converges to a NE, not the internal strat
@@ -53,6 +59,12 @@ class CFR_Solver:
     def get_info_set(self, game_node):
         if (info_set := self.info_sets.get(game_node.infoSet())) is None:
             self.info_sets[game_node.infoSet()] = info_set = InfoSet(len(game_node.children))
+
+        return info_set
+
+    def get_info_set_by_key(self, key, n_children):
+        if (info_set := self.info_sets.get(key)) is None:
+            self.info_sets[key] = info_set = InfoSet(n_children)
 
         return info_set
 

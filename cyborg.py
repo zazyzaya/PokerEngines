@@ -1,8 +1,14 @@
+import gc
 import time
+from tqdm import tqdm
+from joblib import Parallel, delayed
+import pickle
 
 import numpy as np
+import ray
 
 from globals import P1 as RED, P2 as BLUE, C, AbstractGameNode
+from vanilla_cfr import InfoSet
 from mccfr import MCCFR_Solver
 from CybORG_plus_plus.mini_CAGE.minimal import action_mapping, SimplifiedCAGE
 from CybORG_plus_plus.mini_CAGE.red_bline_agent import B_line_minimal
@@ -13,6 +19,7 @@ EVAL_EPISODES = 100
 MOVES_FIRST = RED
 MOVES_LAST = BLUE
 
+ray.init()
 action_map = action_mapping()
 
 class GameNode(AbstractGameNode):
@@ -204,34 +211,119 @@ class RedNode(GameNode):
 
         self.cur_reward = cur_reward
 
+@ray.remote
+def parallel_gen_hist_job(info_sets, n_episodes, eps):
+    env = SimplifiedCAGE(1)
+    red = B_line_minimal()
+
+    return [
+        gen_hist_job(info_sets, eps, env, red)
+        for _ in range(n_episodes)
+    ]
+
+def gen_hist_job(info_sets, eps, env, red_agent):
+    game_node = RedNode(None, None, None, 0)
+
+    history = []
+    pi_z = 1. # pi^{\sigma^\prime}(z)
+    reach_1, reach_2 = 1., 1. # pi^\sigma(z)
+
+    env.reset()
+    red_agent.reset()
+
+    while not game_node.is_leaf:
+        # Not relevant, but will keep it in for now
+        if game_node.player == C:
+            action = np.random.multinomial(1, game_node.probs).nonzero()[0].item()
+
+        # For now, only optimize blue strat
+        elif game_node.player == BLUE:
+            strat = info_sets.get(
+                game_node.infoSet(),
+                np.full(len(game_node.children), 1/len(game_node.children))
+            )
+
+            sample_probs = np.full(len(strat), eps / len(strat))
+            greedy_action = strat.argmax()
+            sample_probs[greedy_action] += 1. - eps
+
+            action_idx = np.random.multinomial(1, sample_probs).nonzero()[0].item()
+            prob = sample_probs[action_idx]
+
+            # Seperate sample prob
+            pi_z *= prob
+
+            # Sample reach probs before taking action
+            history.append((
+                BLUE, game_node.infoSet(), len(game_node.children),
+                action_idx, reach_1, reach_2
+            ))
+
+            # From actual strategy prob
+            reach_2 *= strat[action_idx]
+
+            action = game_node.children[action_idx]
+            _, r, _, _ = env.step(
+                game_node.parent_action,
+                np.array([action])
+            )
+            game_node = RedNode(game_node, action, env, r['Blue'].item())
+
+        # Red strat
+        else:
+            action = red_agent.get_action(env.proc_states['Red'])
+            prob = red_agent.prob
+
+            history.append((
+                RED, game_node.infoSet(), len(game_node.children),
+                action, reach_1, reach_2
+            ))
+
+            # Strat prob and sample prob are the same
+            pi_z *= prob
+            reach_1 *= prob
+
+            game_node = BlueNode(game_node, action, env)
+
+    return history, game_node.reward(), pi_z, reach_1, reach_2
+
 class CageSolver(MCCFR_Solver):
-    def eval_game(self, game_node):
-        rewards = []
-        for e in range(EVAL_EPISODES):
-            red = B_line_minimal()
-            env = SimplifiedCAGE(1) # TODO parallelize
-            rew = 0
+    def __init__(self):
+        super().__init__()
+        self.t = 0
 
-            for step in range(GAME_LEN):
-                obs = env.proc_states
-                red_action = red.get_action(obs['Red'])
+    def _play_one_game(self):
+        red = B_line_minimal()
+        env = SimplifiedCAGE(1) # TODO parallelize
+        rew = 0
 
-                blue = BlueNode(None, red_action, env)
-                infoSet = self.get_info_set(blue)
-                blue_action_idx = np.random.multinomial(
-                    1, infoSet.get_avg_strat()
-                ).nonzero()[0]
+        for step in range(GAME_LEN):
+            obs = env.proc_states
+            red_action = red.get_action(obs['Red'])
 
-                blue_action = blue.children[blue_action_idx]
-                _,r,_,_ = env.step(red_action, blue_action)
-                rew += r['Blue']
+            blue = BlueNode(None, red_action, env)
+            infoSet = self.get_info_set(blue)
+            blue_action_idx = np.random.multinomial(
+                1, infoSet.get_avg_strat()
+            ).nonzero()[0]
 
-            rewards.append(rew.item())
+            blue_action = blue.children[blue_action_idx]
+            _,r,_,_ = env.step(red_action, blue_action)
+            rew += r['Blue'].item()
+
+        return rew
+
+    def eval_game(self, n_episodes, workers):
+        rewards = Parallel(n_jobs=1, prefer='processes')(
+            delayed(self._play_one_game)()
+            for _ in range(n_episodes)
+        )
 
         return sum(rewards) / len(rewards)
 
+    def sample_history(self):
+        game_node = RedNode(None, None, None, 0)
 
-    def sample_history(self, game_node):
         history = []
         env = SimplifiedCAGE(1)
         pi_z = 1. # pi^{\sigma^\prime}(z)
@@ -245,7 +337,7 @@ class CageSolver(MCCFR_Solver):
 
             # For now, only optimize blue strat
             elif game_node.player == BLUE:
-                info_set = self.get_info_set(game_node)
+                info_set = self.get_info_set_readonly(game_node)
                 #action = np.random.multinomial(1, info_set.strat).nonzero()[0].item()
                 #pi_z *= info_set.strat[action]
                 action_idx, prob = self.epsilon_greedy_sampler(info_set.strat)
@@ -264,7 +356,7 @@ class CageSolver(MCCFR_Solver):
                     game_node.parent_action,
                     np.array([action])
                 )
-                game_node = RedNode(game_node, action, env, r['Blue'])
+                game_node = RedNode(game_node, action, env, r['Blue'].item())
 
             # Red strat
             else:
@@ -281,36 +373,118 @@ class CageSolver(MCCFR_Solver):
 
         return history, game_node.reward(), pi_z, reach_1, reach_2
 
+    def one_player_mccfr(self, player, n_episodes, workers):
+        st = time.time()
+
+        strat_snapshot = {key: info.strat for key, info in self.info_sets.items()}
+        strat_ptr = ray.put(strat_snapshot)
+
+        futures = [
+            parallel_gen_hist_job.remote(strat_ptr, n_episodes, self.eps)
+            for _ in range(workers)
+        ]
+        histories = ray.get(futures)
+        histories = sum(histories, [])
+
+        en = time.time()
+        sim_time = en-st
+
+        st = time.time()
+        for (trace, u_i, pi_z, pi_1_z, pi_2_z) in histories:
+            self.t += 1
+            tail_1, tail_2 = 1., 1.
+
+            # Propagate pi_sigma_i(h, z) backward
+            for i in range(len(trace)-1, -1, -1):
+                cur_player,infoSetKey,n_children,action,reach_1,reach_2 = trace[i]
+
+                if cur_player == C:
+                    continue
+
+                if cur_player == player:
+                    # Regret update
+                    if cur_player == RED:
+                        u_i_now = -u_i
+                        pi_not_i_z = pi_2_z # pi_{-i}(z)
+                        reach_i = reach_1   # pi_i(z[I])
+                        tail_i_a = tail_1   # pi_i(z[I]a, z)
+                    elif cur_player == BLUE:
+                        u_i_now = u_i
+                        pi_not_i_z = pi_1_z
+                        reach_i = reach_2
+                        tail_i_a = tail_2
+
+                    infoSet = self.get_info_set_by_key(infoSetKey, n_children)
+                    tail_i = tail_i_a * infoSet.strat[action]   # pi_i(z[I], z)
+                    w_I = (u_i_now * pi_not_i_z) / pi_z         # w_I (obviously)
+
+                    for a in range(n_children):
+                        if a == action:
+                            regret = w_I * (tail_i_a - tail_i)
+                        else:
+                            regret = -w_I * tail_i
+
+                        # Vanilla CFR
+                        #infoSet.cum_regret[a] += regret
+
+                        # CFR+ (Not really meant for MC setting--didn't see any improvemnts)
+                        infoSet.cum_regret[a] = max(0.0, infoSet.cum_regret[a] + regret)
+
+                    iterationsMissed = self.t - infoSet.last_visit
+
+                    # Vanilla CFR
+                    #infoSet.cum_strat += iterationsMissed * reach_i * infoSet.strat
+
+                    # CFR+
+                    weight = (iterationsMissed * (infoSet.last_visit + self.t - 1)) / 2.0
+                    infoSet.cum_strat += weight * reach_i * infoSet.strat
+
+                    infoSet.last_visit = self.t
+                    infoSet.update_strat()
+
+                    if player == RED:
+                        tail_1 *= infoSet.strat[action]
+                    else:
+                        tail_2 *= infoSet.strat[action]
+
+        en = time.time()
+        return sim_time, en-st
+
 def train_mccfr(iters=200_000):
     log = dict()
 
     scores = []
     solver = CageSolver()
-    eval_every = 1_000
+    eval_every = 10
     st = time.time()
 
     tot_sim = 0
     tot_algo = 0
 
+    WORKERS = 100
+    N_EPISODES = 100
+    prog = tqdm(total=eval_every)
     for t in range(1,iters+1):
-        game = RedNode(None, None, None, 0)
-        sim_time, algo_time = solver.one_player_mccfr(t, game, BLUE)
+        sim_time, algo_time = solver.one_player_mccfr(BLUE, N_EPISODES, WORKERS)
         tot_sim += sim_time
         tot_algo += algo_time
+        prog.update()
 
         if t and t % eval_every == 0:
-            print(f'[{t}] Tracking {len(solver.info_sets)} states...')
-            scores.append(solver.eval_game(game))
+            prog.close()
+            print(f'[{t*WORKERS*N_EPISODES}] Tracking {len(solver.info_sets)} states...')
+            print(f'\tSim Time: {tot_sim}s, Algo time: {tot_algo}s')
+            scores.append(solver.eval_game(100, WORKERS))
             print(f"\tAvg score {scores[-1]} ({time.time() - st}s)")
-            print(f'\tSim Time: {tot_sim/t}s, Algo time: {tot_algo/t}s')
             st = time.time()
+            prog = tqdm(total=eval_every)
 
+            tot_sim = 0; tot_algo = 0
+            with open('cyborg.pkl', 'wb+') as f:
+                pickle.dump(solver, f)
 
-    import matplotlib.pyplot as plt
-    x = range(0,iters,eval_every)
-    plt.plot(x, scores)
+            with open('log.txt', 'a') as f:
+                f.write(f'{t*WORKERS*N_EPISODES},{scores[-1]}\n')
 
-    plt.legend()
-    plt.show()
-
-train_mccfr()
+if __name__ == '__main__':
+    train_mccfr()
