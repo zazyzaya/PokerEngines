@@ -29,12 +29,6 @@ class InfoSet:
         else:
             self.strat = non_neg_regret / norm
 
-        # If it's been training a really long time, these values will
-        # get huge. Periodically adjust them back down to avoid
-        # FLOP precision loss
-        if np.sum(self.cum_strat) > 1e12:
-            self.cum_strat /= 1e6
-
     def get_avg_strat(self):
         '''
         This is what converges to a NE, not the internal strat

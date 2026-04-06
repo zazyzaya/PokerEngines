@@ -14,6 +14,13 @@ from CybORG_plus_plus.mini_CAGE.minimal import action_mapping, SimplifiedCAGE
 from CybORG_plus_plus.mini_CAGE.red_bline_agent import B_line_minimal
 
 GAME_LEN = 30
+
+# Want rewards to be positive, so must shift them by the approximate
+# floor for worst game (sleep agent.) This way, scores are positive
+# for blue agent iff they outperform the sleep agent in some way,
+# negative otherwise.
+BASELINE_SHIFT = {30: 240, 50: 480, 100: 1135}
+
 EVAL_EPISODES = 100
 
 MOVES_FIRST = RED
@@ -145,9 +152,9 @@ class BlueNode(GameNode):
         activity = obs[:2*-13].reshape(13,4)
 
         threats = np.zeros(13, dtype=int)
-        threats[activity[:, 0] > 0] = 1 # Scanned
+        #threats[activity[:, 0] > 0] = 1 # Scanned (ignore)
         threats[activity[:, 1] > 0] = 1 # Anomalous
-        threats[activity[:, 2] > 0] = 2 # Root
+        threats[activity[:, 2] > 0] = 3 # Root
         threats[activity[:, 3] > 0] = 2 # User
 
         # 2. Targeted Action Pruning
@@ -159,6 +166,7 @@ class BlueNode(GameNode):
             pruned_actions = []
 
             for action in legal_actions:
+                # Never sleep
                 if action == 0:
                     continue
 
@@ -285,7 +293,7 @@ def gen_hist_job(info_sets, eps, env, red_agent):
 
             game_node = BlueNode(game_node, action, env)
 
-    return history, game_node.reward(), pi_z, reach_1, reach_2
+    return history, game_node.reward() + BASELINE_SHIFT[GAME_LEN], pi_z, reach_1, reach_2
 
 class CageSolver(MCCFR_Solver):
     def __init__(self):
@@ -320,58 +328,6 @@ class CageSolver(MCCFR_Solver):
         )
 
         return sum(rewards) / len(rewards)
-
-    def sample_history(self):
-        game_node = RedNode(None, None, None, 0)
-
-        history = []
-        env = SimplifiedCAGE(1)
-        pi_z = 1. # pi^{\sigma^\prime}(z)
-        reach_1, reach_2 = 1., 1. # pi^\sigma(z)
-        red_agent = B_line_minimal()
-
-        while not game_node.is_leaf:
-            # Not relevant, but will keep it in for now
-            if game_node.player == C:
-                action = np.random.multinomial(1, game_node.probs).nonzero()[0].item()
-
-            # For now, only optimize blue strat
-            elif game_node.player == BLUE:
-                info_set = self.get_info_set_readonly(game_node)
-                #action = np.random.multinomial(1, info_set.strat).nonzero()[0].item()
-                #pi_z *= info_set.strat[action]
-                action_idx, prob = self.epsilon_greedy_sampler(info_set.strat)
-
-                # Seperate sample prob
-                pi_z *= prob
-
-                # Sample reach probs before taking action
-                history.append((game_node, action_idx, reach_1, reach_2))
-
-                # From actual strategy prob
-                reach_2 *= info_set.strat[action_idx]
-
-                action = game_node.children[action_idx]
-                _, r, _, _ = env.step(
-                    game_node.parent_action,
-                    np.array([action])
-                )
-                game_node = RedNode(game_node, action, env, r['Blue'].item())
-
-            # Red strat
-            else:
-                action = red_agent.get_action(env.proc_states['Red'])
-                prob = red_agent.prob
-
-                history.append((game_node, action, reach_1, reach_2))
-
-                # Strat prob and sample prob are the same
-                pi_z *= prob
-                reach_1 *= prob
-
-                game_node = BlueNode(game_node, action, env)
-
-        return history, game_node.reward(), pi_z, reach_1, reach_2
 
     def one_player_mccfr(self, player, n_episodes, workers):
         st = time.time()
@@ -433,11 +389,11 @@ class CageSolver(MCCFR_Solver):
                     iterationsMissed = self.t - infoSet.last_visit
 
                     # Vanilla CFR
-                    #infoSet.cum_strat += iterationsMissed * reach_i * infoSet.strat
+                    infoSet.cum_strat += iterationsMissed * reach_i * infoSet.strat
 
-                    # CFR+
-                    weight = (iterationsMissed * (infoSet.last_visit + self.t - 1)) / 2.0
-                    infoSet.cum_strat += weight * reach_i * infoSet.strat
+                    # CFR+ # Don't use bc have large batch sizes
+                    #weight = (iterationsMissed * (infoSet.last_visit + self.t - 1)) / 2.0
+                    #infoSet.cum_strat += weight * reach_i * infoSet.strat
 
                     infoSet.last_visit = self.t
                     infoSet.update_strat()
@@ -451,40 +407,30 @@ class CageSolver(MCCFR_Solver):
         return sim_time, en-st
 
 def train_mccfr(iters=200_000):
-    log = dict()
-
-    scores = []
     solver = CageSolver()
-    eval_every = 10
     st = time.time()
 
-    tot_sim = 0
-    tot_algo = 0
+    with open('log.txt', 'w+') as f:
+        f.write('episodes,explored_states,score\n')
 
     WORKERS = 100
     N_EPISODES = 100
-    prog = tqdm(total=eval_every)
     for t in range(1,iters+1):
         sim_time, algo_time = solver.one_player_mccfr(BLUE, N_EPISODES, WORKERS)
-        tot_sim += sim_time
-        tot_algo += algo_time
-        prog.update()
+        n_states = len(solver.info_sets)
 
-        if t and t % eval_every == 0:
-            prog.close()
-            print(f'[{t*WORKERS*N_EPISODES}] Tracking {len(solver.info_sets)} states...')
-            print(f'\tSim Time: {tot_sim}s, Algo time: {tot_algo}s')
-            scores.append(solver.eval_game(100, WORKERS))
-            print(f"\tAvg score {scores[-1]} ({time.time() - st}s)")
-            st = time.time()
-            prog = tqdm(total=eval_every)
+        print(f'[{t*WORKERS*N_EPISODES}] Tracking {n_states} states...')
+        print(f'\tSim Time: {sim_time:0.2f}s, Algo time: {algo_time:0.2f}s')
 
-            tot_sim = 0; tot_algo = 0
-            with open('cyborg.pkl', 'wb+') as f:
-                pickle.dump(solver, f)
+        score = solver.eval_game(100, WORKERS)
+        print(f"\tAvg score {score:0.2f} ({(time.time() - st):0.2f}s)")
+        st = time.time()
 
-            with open('log.txt', 'a') as f:
-                f.write(f'{t*WORKERS*N_EPISODES},{scores[-1]}\n')
+        with open('cyborg.pkl', 'wb+') as f:
+            pickle.dump(solver, f)
+
+        with open('log.txt', 'a') as f:
+            f.write(f'{t*WORKERS*N_EPISODES},{n_states},{score}\n')
 
 if __name__ == '__main__':
     train_mccfr()
