@@ -406,9 +406,25 @@ class CageSolver(MCCFR_Solver):
         en = time.time()
         return sim_time, en-st
 
+class Buffer:
+    def __init__(self, buff_size=25):
+        self.arr = [-BASELINE_SHIFT[GAME_LEN] for _ in range(buff_size)]
+        self.ptr = 0
+        self.len = buff_size
+
+    def push(self, item):
+        self.arr[self.ptr] = item
+        self.ptr += 1
+        self.ptr %= self.len
+
+    def avg(self):
+        return sum(self.arr) / self.len
+
 def train_mccfr(iters=200_000):
     solver = CageSolver()
     st = time.time()
+    buff = Buffer()
+    best = buff.avg()
 
     with open('log.txt', 'w+') as f:
         f.write('episodes,explored_states,score\n')
@@ -423,11 +439,23 @@ def train_mccfr(iters=200_000):
         print(f'\tSim Time: {sim_time:0.2f}s, Algo time: {algo_time:0.2f}s')
 
         score = solver.eval_game(100, WORKERS)
+        buff.push(score)
+
         print(f"\tAvg score {score:0.2f} ({(time.time() - st):0.2f}s)")
+        print(f'\tRolling avg: {buff.avg():0.2f}', end='')
         st = time.time()
 
         with open('cyborg.pkl', 'wb+') as f:
             pickle.dump(solver, f)
+
+        if (new_best := buff.avg()) > best:
+            print('*')
+            with open('cyborg_best.pkl', 'wb+') as f:
+                pickle.dump(solver, f)
+
+            best = new_best
+        else:
+            print()
 
         with open('log.txt', 'a') as f:
             f.write(f'{t*WORKERS*N_EPISODES},{n_states},{score}\n')
