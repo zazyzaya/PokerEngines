@@ -1,4 +1,4 @@
-import gc
+from argparse import ArgumentParser
 import time
 from tqdm import tqdm
 from joblib import Parallel, delayed
@@ -13,20 +13,20 @@ from mccfr import MCCFR_Solver
 from CybORG_plus_plus.mini_CAGE.minimal import action_mapping, SimplifiedCAGE
 from CybORG_plus_plus.mini_CAGE.red_bline_agent import B_line_minimal
 
-GAME_LEN = 30
+GAME_LEN = 10
 
 # Want rewards to be positive, so must shift them by the approximate
 # floor for worst game (sleep agent.) This way, scores are positive
 # for blue agent iff they outperform the sleep agent in some way,
 # negative otherwise.
-BASELINE_SHIFT = {30: 240, 50: 480, 100: 1135}
+BASELINE_SHIFT = {10: 10, 20: 170, 30: 240, 50: 480, 100: 1135}
+BASELINE_RND =   {10: 8,  20: 73,  30: 165, 50: 450, 100: 918}
 
 EVAL_EPISODES = 100
 
 MOVES_FIRST = RED
 MOVES_LAST = BLUE
 
-ray.init()
 action_map = action_mapping()
 
 class GameNode(AbstractGameNode):
@@ -300,12 +300,12 @@ class CageSolver(MCCFR_Solver):
         super().__init__()
         self.t = 0
 
-    def _play_one_game(self):
+    def _play_one_game(self, game_len=GAME_LEN, verbose=False):
         red = B_line_minimal()
         env = SimplifiedCAGE(1) # TODO parallelize
         rew = 0
 
-        for step in range(GAME_LEN):
+        for step in range(game_len):
             obs = env.proc_states
             red_action = red.get_action(obs['Red'])
 
@@ -317,6 +317,51 @@ class CageSolver(MCCFR_Solver):
 
             blue_action = blue.children[blue_action_idx]
             _,r,_,_ = env.step(red_action, blue_action)
+
+            if verbose:
+                print(action_map['Red'][red_action.item()], action_map['Blue'][blue_action.item()], r['Blue'].item())
+
+            rew += r['Blue'].item()
+
+        return rew
+
+    def _play_one_game_rnd(self, game_len=GAME_LEN, verbose=False):
+        red = B_line_minimal()
+        env = SimplifiedCAGE(1) # TODO parallelize
+        rew = 0
+
+        for step in range(game_len):
+            obs = env.proc_states
+            red_action = red.get_action(obs['Red'])
+
+            blue = BlueNode(None, red_action, env)
+            blue_action = np.random.choice(
+                blue.children
+            )
+
+            _,r,_,_ = env.step(red_action, np.array([blue_action]))
+
+            if verbose:
+                print(action_map['Red'][red_action.item()], action_map['Blue'][blue_action.item()], r['Blue'].item())
+
+            rew += r['Blue'].item()
+
+        return rew
+
+    def _play_one_game_sleep(self, game_len=GAME_LEN, verbose=False):
+        red = B_line_minimal()
+        env = SimplifiedCAGE(1) # TODO parallelize
+        rew = 0
+
+        for step in range(game_len):
+            obs = env.proc_states
+            red_action = red.get_action(obs['Red'])
+
+            _,r,_,_ = env.step(red_action, np.array([0]))
+
+            if verbose:
+                print(action_map['Red'][red_action.item()], "Sleep", r['Blue'].item())
+
             rew += r['Blue'].item()
 
         return rew
@@ -426,7 +471,7 @@ def train_mccfr(iters=200_000):
     buff = Buffer()
     best = buff.avg()
 
-    with open('log.txt', 'w+') as f:
+    with open(f'log{TAG}.txt', 'w+') as f:
         f.write('episodes,explored_states,score\n')
 
     WORKERS = 100
@@ -445,20 +490,34 @@ def train_mccfr(iters=200_000):
         print(f'\tRolling avg: {buff.avg():0.2f}', end='')
         st = time.time()
 
-        with open('cyborg.pkl', 'wb+') as f:
+        with open(f'cyborg{TAG}.pkl', 'wb+') as f:
             pickle.dump(solver, f)
 
         if (new_best := buff.avg()) > best:
             print('*')
-            with open('cyborg_best.pkl', 'wb+') as f:
+            with open(f'cyborg{TAG}_best.pkl', 'wb+') as f:
                 pickle.dump(solver, f)
 
             best = new_best
         else:
             print()
 
-        with open('log.txt', 'a') as f:
+        with open(f'log{TAG}.txt', 'a') as f:
             f.write(f'{t*WORKERS*N_EPISODES},{n_states},{score}\n')
 
 if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument('-l', '--len', type=int, default=30)
+    parser.add_argument('--tag')
+
+    args = parser.parse_args()
+    GAME_LEN = args.len
+
+    tag = args.tag
+    if tag:
+        TAG = f'-{tag}'
+    else:
+        TAG = ''
+
+    ray.init()
     train_mccfr()
